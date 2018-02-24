@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strings"
 
 	"pault.ag/go/archive"
 	"pault.ag/go/debian/control"
@@ -23,6 +24,14 @@ type sourceIndex struct {
 	Package         string
 	Version         version.Version
 	Directory       string
+}
+
+func (src *sourceIndex) importPath() string {
+	importPath := src.GoImportPath
+	if to, ok := rewrite[src.Package]; ok {
+		importPath = to
+	}
+	return strings.Split(importPath, ",")[0]
 }
 
 func dependsOnGo(sidx *sourceIndex) bool {

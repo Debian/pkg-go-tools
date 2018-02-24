@@ -49,6 +49,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -69,6 +70,10 @@ var (
 	debianMirror = flag.String("debian_mirror",
 		"http://localhost:3142/deb.debian.org/debian",
 		"HTTP URL of the Debian mirror to use. Install apt-cacher-ng(8) instead of specifying this flag to massively cut down on bandwidth (useful even with fast links).")
+
+	dsc = flag.String("dsc",
+		"",
+		"Path to a single .dsc file to unpack, instead of operating on Debian unstable. Note that the destination is first deleted, then unpacked from scratch (i.e. not atomic), as this flag is only supposed to be used when working within a filesystem overlay.")
 )
 
 var ignored = map[string]bool{
@@ -91,8 +96,109 @@ var rewrite = map[string]string{
 	"golang-github-mvo5-goconfigparser": "github.com/mvo5/goconfigparser",         // https://github.com/vorlonofportland/goconfigparser/pull/1
 }
 
+func process(g *archive.Downloader, tempdir, importPath string, src *sourceIndex) error {
+	var origTar, debTar control.FileHash
+	for _, c := range src.Checksums() {
+		if strings.HasSuffix(c.Filename, ".asc") {
+			continue // skip signature files
+		}
+		if strings.Contains(c.Filename, ".orig.tar.") {
+			origTar = c
+		} else if strings.Contains(c.Filename, ".debian.tar.") {
+			debTar = c
+		}
+	}
+	if origTar.Filename == "" {
+		log.Printf("ERROR: src:%s is missing .orig.tar. file", src.Package)
+		return nil
+	}
+	if debTar.Filename == "" {
+		log.Printf("ERROR: src:%s is missing .debian.tar. file", src.Package)
+		return nil
+	}
+	origTar.Filename = path.Join(src.Directory, origTar.Filename)
+	origTarTmp, err := g.TempFile(origTar)
+	if err != nil {
+		return fmt.Errorf("src:%s: download(origTar=%s): %v", src.Package, origTar.Filename, err)
+	}
+	if err := origTarTmp.Close(); err != nil {
+		return err
+	}
+	defer os.Remove(origTarTmp.Name())
+
+	debTar.Filename = path.Join(src.Directory, debTar.Filename)
+	debTarTmp, err := g.TempFile(debTar)
+	if err != nil {
+		return fmt.Errorf("src:%s: download(debTar=%s): %v", src.Package, debTar.Filename, err)
+	}
+	if err := debTarTmp.Close(); err != nil {
+		return err
+	}
+	defer os.Remove(debTarTmp.Name())
+
+	destRepo := filepath.Join(tempdir, importPath)
+	if err := unpack(destRepo, origTarTmp.Name()); err != nil {
+		return fmt.Errorf("unpacking orig tarball: %v", err)
+	}
+	if err := unpack(filepath.Join(destRepo, "debian"), debTarTmp.Name()); err != nil {
+		return fmt.Errorf("unpacking debian tarball: %v", err)
+	}
+	if err := applyPatches(destRepo); err != nil {
+		return fmt.Errorf("applying patches: %v", err)
+	}
+	if err := createLinks(tempdir, destRepo); err != nil {
+		return fmt.Errorf("creating links: %v", err)
+	}
+	if err := cleanFiles(destRepo); err != nil {
+		return fmt.Errorf("cleaning files: %v", err)
+	}
+
+	// enforce resulting files are world-readable for building with unprivileged
+	// users (e.g. golang-github-svent-go-nbreader comes with a debian tarball
+	// without word-readable bits). Permissions were copied from “apt source”.
+	chmod := exec.Command("chmod", "-R", "--", "u+r+w+X,g+r-w+X,o+r-w+X", destRepo)
+	chmod.Stderr = os.Stderr
+	if err := chmod.Run(); err != nil {
+		return fmt.Errorf("%v: %v", chmod.Args, err)
+	}
+
+	// Persist all hashes which define the package into the
+	// debian/.hashes file. This can be used by downstream software to
+	// detect package changes for caching.
+	hashes := []byte(strings.Join([]string{
+		origTar.Filename + "=" + origTar.Hash,
+		debTar.Filename + "=" + debTar.Hash,
+	}, "\n") + "\n")
+	if err := ioutil.WriteFile(filepath.Join(destRepo, "debian", ".hashes"), hashes, 0644); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func logic() error {
 	const parallel = 20
+	g := &archive.Downloader{
+		Parallel:            parallel,
+		MaxTransientRetries: 3,
+		Mirror:              strings.TrimSuffix(*debianMirror, "/"),
+		// TODO: insecure flag to skip GPG verification on systems missing DebianArchiveKeyring
+	}
+	if *dsc != "" {
+		g.LocalMirror = filepath.Dir(*dsc)
+		var src sourceIndex
+		b, err := ioutil.ReadFile(*dsc)
+		if err != nil {
+			return err
+		}
+		if err := control.Unmarshal(&src, bytes.NewReader(b)); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(filepath.Join("src/" + src.importPath())); err != nil {
+			return err
+		}
+		return process(g, "src/", src.importPath(), &src)
+	}
 
 	start := time.Now()
 	tempdir, err := ioutil.TempDir(".", "src-tmp-")
@@ -100,12 +206,7 @@ func logic() error {
 		return err
 	}
 	defer os.RemoveAll(tempdir)
-	g := &archive.Downloader{
-		Parallel:            parallel,
-		MaxTransientRetries: 3,
-		Mirror:              strings.TrimSuffix(*debianMirror, "/"),
-		// TODO: insecure flag to skip GPG verification on systems missing DebianArchiveKeyring
-	}
+
 	release, rd, err := g.Release("unstable")
 	if err != nil {
 		return err
@@ -137,16 +238,12 @@ func logic() error {
 		if src.ExtraSourceOnly {
 			continue // see https://bugs.debian.org/814156 for details
 		}
-		importPath := src.GoImportPath
-		if to, ok := rewrite[src.Package]; ok {
-			importPath = to
-		}
-		if importPath == "" {
+		if src.importPath() == "" {
 			// TODO: document what this means
 			log.Printf("package src:%s is missing xs-go-import-path", src.Package)
 			continue
 		}
-		if importPath == "github.com/spf13/cobra" {
+		if src.importPath() == "github.com/spf13/cobra" {
 			log.Printf("pkg = %v", src.Package)
 		}
 		if src.Package == "golang-github-dnephin-cobra" {
@@ -162,83 +259,7 @@ func logic() error {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			var origTar, debTar control.FileHash
-			for _, c := range src.Checksums() {
-				if strings.HasSuffix(c.Filename, ".asc") {
-					continue // skip signature files
-				}
-				if strings.Contains(c.Filename, ".orig.tar.") {
-					origTar = c
-				} else if strings.Contains(c.Filename, ".debian.tar.") {
-					debTar = c
-				}
-			}
-			if origTar.Filename == "" {
-				log.Printf("ERROR: src:%s is missing .orig.tar. file", src.Package)
-				return nil
-			}
-			if debTar.Filename == "" {
-				log.Printf("ERROR: src:%s is missing .debian.tar. file", src.Package)
-				return nil
-			}
-			origTar.Filename = path.Join(src.Directory, origTar.Filename)
-			origTarTmp, err := g.TempFile(origTar)
-			if err != nil {
-				return fmt.Errorf("src:%s: download(origTar=%s): %v", src.Package, origTar.Filename, err)
-			}
-			if err := origTarTmp.Close(); err != nil {
-				return err
-			}
-			defer os.Remove(origTarTmp.Name())
-
-			debTar.Filename = path.Join(src.Directory, debTar.Filename)
-			debTarTmp, err := g.TempFile(debTar)
-			if err != nil {
-				return fmt.Errorf("src:%s: download(debTar=%s): %v", src.Package, debTar.Filename, err)
-			}
-			if err := debTarTmp.Close(); err != nil {
-				return err
-			}
-			defer os.Remove(debTarTmp.Name())
-
-			destRepo := filepath.Join(tempdir, strings.Split(importPath, ",")[0])
-			if err := unpack(destRepo, origTarTmp.Name()); err != nil {
-				return fmt.Errorf("unpacking orig tarball: %v", err)
-			}
-			if err := unpack(filepath.Join(destRepo, "debian"), debTarTmp.Name()); err != nil {
-				return fmt.Errorf("unpacking debian tarball: %v", err)
-			}
-			if err := applyPatches(destRepo); err != nil {
-				return fmt.Errorf("applying patches: %v", err)
-			}
-			if err := createLinks(tempdir, destRepo); err != nil {
-				return fmt.Errorf("creating links: %v", err)
-			}
-			if err := cleanFiles(destRepo); err != nil {
-				return fmt.Errorf("cleaning files: %v", err)
-			}
-
-			// enforce resulting files are world-readable for building with unprivileged
-			// users (e.g. golang-github-svent-go-nbreader comes with a debian tarball
-			// without word-readable bits). Permissions were copied from “apt source”.
-			chmod := exec.Command("chmod", "-R", "--", "u+r+w+X,g+r-w+X,o+r-w+X", destRepo)
-			chmod.Stderr = os.Stderr
-			if err := chmod.Run(); err != nil {
-				return fmt.Errorf("%v: %v", chmod.Args, err)
-			}
-
-			// Persist all hashes which define the package into the
-			// debian/.hashes file. This can be used by downstream software to
-			// detect package changes for caching.
-			hashes := []byte(strings.Join([]string{
-				origTar.Filename + "=" + origTar.Hash,
-				debTar.Filename + "=" + debTar.Hash,
-			}, "\n") + "\n")
-			if err := ioutil.WriteFile(filepath.Join(destRepo, "debian", ".hashes"), hashes, 0644); err != nil {
-				return err
-			}
-
-			return nil
+			return process(g, tempdir, src.importPath(), &src)
 		})
 	}
 
